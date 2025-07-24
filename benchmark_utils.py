@@ -31,15 +31,13 @@ from typing import (
     get_origin,
     List,
     Optional,
-    Set,
     Tuple,
     TypeVar,
     Union,
 )
 
-import click
-
 import torch
+import yaml
 from torch import multiprocessing as mp
 from torch.autograd.profiler import record_function
 from torchrec.distributed import DistributedModelParallel
@@ -59,12 +57,10 @@ from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.distributed.types import DataType, ModuleSharder, ShardingEnv
 from torchrec.fx import symbolic_trace
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
-from torchrec.quant.embedding_modules import (
-    EmbeddingBagCollection as QuantEmbeddingBagCollection,
-    EmbeddingCollection as QuantEmbeddingCollection,
-)
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port
+import psutil
+import resource
 
 logger: logging.Logger = logging.getLogger()
 
@@ -107,14 +103,14 @@ class CompileMode(Enum):
 
 
 @dataclass
-class MemoryStats:
+class GPUMemoryStats:
     rank: int
     malloc_retries: int
     max_mem_allocated_mbs: int
     max_mem_reserved_mbs: int
 
     @classmethod
-    def for_device(cls, rank: int) -> "MemoryStats":
+    def for_device(cls, rank: int) -> "GPUMemoryStats":
         stats = torch.cuda.memory_stats(rank)
         alloc_retries = stats.get("num_alloc_retries", 0)
         max_allocated = stats.get("allocated_bytes.all.peak", 0)
@@ -130,27 +126,52 @@ class MemoryStats:
         return f"Rank {self.rank}: retries={self.malloc_retries}, allocated={self.max_mem_allocated_mbs:7}mb, reserved={self.max_mem_reserved_mbs:7}mb"
 
 
+@dataclass
+class CPUMemoryStats:
+    peak_rss_mbs: int
+    current_rss_mbs: int
+
+    @classmethod
+    def for_process(cls) -> "CPUMemoryStats":
+        # Peak RSS from resource.getrusage (in KB on Linux)
+        peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_rss_mb = peak_rss_kb // 1024
+        
+        # Current RSS from psutil (in bytes)
+        process = psutil.Process()
+        current_rss_mb = process.memory_info().rss // 1024 // 1024
+        
+        return cls(peak_rss_mb, current_rss_mb)
+
+    def __str__(self) -> str:
+        return f"CPU: peak_rss={self.peak_rss_mbs:7}mb, current_rss={self.current_rss_mbs:7}mb"
+
+
+@dataclass
 class BenchmarkResult:
     "Class for holding results of benchmark runs"
     short_name: str
-    gpu_elapsed_time: torch.Tensor  # milliseconds – elapsed GPU time per iter (CUDA events)
-    cpu_elapsed_time: torch.Tensor  # milliseconds – active CPU time per iter (process_time)
-    mem_stats: List[MemoryStats]  # memory stats per rank
+    gpu_elapsed_time: torch.Tensor  # milliseconds
+    cpu_elapsed_time: torch.Tensor  # milliseconds
+    gpu_mem_stats: List[GPUMemoryStats]  # GPU memory stats per rank
+    cpu_mem_stats: CPUMemoryStats  # CPU memory stats
     rank: int = -1
 
     def __str__(self) -> str:
-        gpu_runtime = f"GPU Runtime (P90): {self.runtime_percentile(90, device='gpu'):.2f} ms"
-        cpu_runtime = f"CPU Runtime (P90): {self.runtime_percentile(90, device='cpu'):.2f} ms"
-        if len(self.mem_stats) == 0:
-            return f"{self.short_name: <{35}} |  {gpu_runtime} | {cpu_runtime}"
+        gpu_runtime = (
+            f"GPU Runtime (P90): {self.runtime_percentile(90, device='gpu'):.2f} ms"
+        )
+        cpu_runtime = (
+            f"CPU Runtime (P90): {self.runtime_percentile(90, device='cpu'):.2f} ms"
+        )
+        if len(self.gpu_mem_stats) == 0:
+            return f"{self.short_name: <{35}} |  {gpu_runtime} | {cpu_runtime} | {self.cpu_mem_stats}"
         mem_alloc = (
             f"Peak Memory alloc (P90): {self.max_mem_alloc_percentile(90)/1000:.2f} GB"
         )
         mem_reserved = f"Peak Memory reserved (P90): {self.max_mem_reserved_percentile(90)/1000:.2f} GB"
         malloc_retries = f"Malloc retries (P50/P90/P100): {self.mem_retries(50)} / {self.mem_retries(90)} / {self.mem_retries(100)}"
-        return (
-            f"{self.short_name: <{35}} | {malloc_retries} | {gpu_runtime} | {cpu_runtime} | {mem_alloc} | {mem_reserved}"
-        )
+        return f"{self.short_name: <{35}} | {malloc_retries} | {gpu_runtime} | {cpu_runtime} | {mem_alloc} | {mem_reserved} | {self.cpu_mem_stats}"
 
     def runtime_percentile(
         self,
@@ -165,9 +186,7 @@ class BenchmarkResult:
             interpolation: See ``torch.quantile``.
             device: 'gpu' for CUDA event timings, 'cpu' for active CPU timings.
         """
-        timings = (
-            self.gpu_elapsed_time if device == "gpu" else self.cpu_elapsed_time
-        )
+        timings = self.gpu_elapsed_time if device == "gpu" else self.cpu_elapsed_time
         return torch.quantile(
             timings,
             percentile / 100.0,
@@ -197,125 +216,66 @@ class BenchmarkResult:
 
     def _mem_percentile(
         self,
-        mem_selector: Callable[[MemoryStats], int],
+        mem_selector: Callable[[GPUMemoryStats], int],
         percentile: int = 50,
         interpolation: str = "nearest",
     ) -> torch.Tensor:
         mem_data = torch.tensor(
-            [mem_selector(mem_stat) for mem_stat in self.mem_stats], dtype=torch.float
+            [mem_selector(mem_stat) for mem_stat in self.gpu_mem_stats], dtype=torch.float
         )
         return torch.quantile(mem_data, percentile / 100.0, interpolation=interpolation)
 
 
-class ECWrapper(torch.nn.Module):
+class ModuleWrapper(torch.nn.Module):
     """
-    Wrapper Module for benchmarking EC Modules
+    A wrapper for nn.modules that allows them to accept inputs
+    of type KeyedJaggedTensor or ModelInput and forwards them to the
+    underlying module. This wrapper is necessary to provide compatibility
+    with FX tracing.
 
     Args:
-        module: module to benchmark
-
-    Call Args:
-        input: KeyedJaggedTensor KJT input to module
-
-    Returns:
-        output: KT output from module
+        module: The torch.nn.Module to be wrapped.
 
     Example:
-        e1_config = EmbeddingConfig(
-            name="t1", embedding_dim=3, num_embeddings=10, feature_names=["f1"]
+        import torch
+        from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+        from torchrec.distributed.benchmark.benchmark_utils import ModuleWrapper
+
+        # Create a simple module
+        module = torch.nn.Linear(10, 5)
+        wrapped_module = ModuleWrapper(module)
+
+        # Create a KeyedJaggedTensor input
+        values = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
+        weights = None
+        lengths = torch.tensor([2, 0, 1, 1, 3, 1])
+        offsets = torch.tensor([0, 2, 2, 3, 4, 7, 8])
+        keys = ["F1", "F2", "F3"]
+        kjt = KeyedJaggedTensor(
+            values=values,
+            weights=weights,
+            lengths=lengths,
+            offsets=offsets,
+            keys=keys,
         )
-        e2_config = EmbeddingConfig(
-            name="t2", embedding_dim=3, num_embeddings=10, feature_names=["f2"]
-        )
 
-        ec = EmbeddingCollection(tables=[e1_config, e2_config])
-
-        features = KeyedJaggedTensor(
-            keys=["f1", "f2"],
-            values=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
-            offsets=torch.tensor([0, 2, 2, 3, 4, 5, 8]),
-        )
-
-        ec.qconfig = torch.quantization.QConfig(
-            activation=torch.quantization.PlaceholderObserver.with_args(
-                dtype=torch.qint8
-            ),
-            weight=torch.quantization.PlaceholderObserver.with_args(dtype=torch.qint8),
-        )
-
-        qec = QuantEmbeddingCollection.from_float(ecc)
-
-        wrapped_module = ECWrapper(qec)
-        quantized_embeddings = wrapped_module(features)
+        # Forward the input through the wrapped module
+        output = wrapped_module(kjt)
     """
 
     def __init__(self, module: torch.nn.Module) -> None:
         super().__init__()
         self._module = module
 
-    def forward(self, input: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
+    def forward(self, input):  # pyre-ignore[3]
         """
+        Forward pass of the wrapped module.
+
         Args:
-            input (KeyedJaggedTensor): KJT of form [F X B X L].
+            input: Input of type KeyedJaggedTensor or ModelInput to be forwarded to the underlying module.
 
         Returns:
-            Dict[str, JaggedTensor]
-        """
-        return self._module.forward(input)
-
-
-class EBCWrapper(torch.nn.Module):
-    """
-    Wrapper Module for benchmarking Modules
-
-    Args:
-        module: module to benchmark
-
-    Call Args:
-        input: KeyedJaggedTensor KJT input to module
-
-    Returns:
-        output: KT output from module
-
-    Example:
-        table_0 = EmbeddingBagConfig(
-            name="t1", embedding_dim=3, num_embeddings=10, feature_names=["f1"]
-        )
-        table_1 = EmbeddingBagConfig(
-            name="t2", embedding_dim=4, num_embeddings=10, feature_names=["f2"]
-        )
-        ebc = EmbeddingBagCollection(tables=[eb1_config, eb2_config])
-
-        features = KeyedJaggedTensor(
-            keys=["f1", "f2"],
-            values=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
-            offsets=torch.tensor([0, 2, 2, 3, 4, 5, 8]),
-        )
-
-        ebc.qconfig = torch.quantization.QConfig(
-            activation=torch.quantization.PlaceholderObserver.with_args(
-                dtype=torch.qint8
-            ),
-            weight=torch.quantization.PlaceholderObserver.with_args(dtype=torch.qint8),
-        )
-
-        qebc = QuantEmbeddingBagCollection.from_float(ebc)
-
-        wrapped_module = EBCWrapper(qebc)
-        quantized_embeddings = wrapped_module(features)
-    """
-
-    def __init__(self, module: torch.nn.Module) -> None:
-        super().__init__()
-        self._module = module
-
-    def forward(self, input: KeyedJaggedTensor) -> KeyedTensor:
-        """
-        Args:
-            input (KeyedJaggedTensor): KJT of form [F X B X L].
-
-        Returns:
-            KeyedTensor
+            The output from the underlying module's forward pass.
         """
         return self._module.forward(input)
 
@@ -367,11 +327,31 @@ def get_inputs(
     batch_size: int,
     world_size: int,
     num_inputs: int,
+    num_float_features: int,
     train: bool,
     pooling_configs: Optional[List[int]] = None,
     variable_batch_embeddings: bool = False,
-) -> List[List[KeyedJaggedTensor]]:
-    inputs_batch: List[List[KeyedJaggedTensor]] = []
+    only_kjt: bool = False,
+) -> Union[List[List[ModelInput]], List[List[KeyedJaggedTensor]]]:
+    """
+    Generate inputs for benchmarking.
+
+    Args:
+        tables: List of embedding tables configurations
+        batch_size: Batch size for generated inputs
+        world_size: Number of ranks/processes
+        num_inputs: Number of input batches to generate
+        num_float_features: Number of float features
+        train: Whether inputs are for training
+        pooling_configs: Optional pooling factors for tables
+        variable_batch_embeddings: Whether to use variable batch size
+        only_kjt: If True, return KeyedJaggedTensor instead of ModelInput
+
+    Returns:
+        If only_kjt is False: List of lists of ModelInput objects
+        If only_kjt is True: List of lists of KeyedJaggedTensor objects
+    """
+    inputs_batch = []
 
     if variable_batch_embeddings and not train:
         raise RuntimeError("Variable batch size is only supported in training mode")
@@ -381,14 +361,14 @@ def get_inputs(
             _, model_input_by_rank = ModelInput.generate_variable_batch_input(
                 average_batch_size=batch_size,
                 world_size=world_size,
-                num_float_features=0,
+                num_float_features=num_float_features,
                 tables=tables,
             )
         else:
             _, model_input_by_rank = ModelInput.generate(
                 batch_size=batch_size,
                 world_size=world_size,
-                num_float_features=0,
+                num_float_features=num_float_features,
                 tables=tables,
                 weighted_tables=[],
                 tables_pooling=pooling_configs,
@@ -397,21 +377,31 @@ def get_inputs(
             )
 
         if train:
-            sparse_features_by_rank = [
-                model_input.idlist_features
-                for model_input in model_input_by_rank
-                if isinstance(model_input.idlist_features, KeyedJaggedTensor)
-            ]
-            inputs_batch.append(sparse_features_by_rank)
+            inputs_batch.append(
+                [
+                    model_input
+                    for model_input in model_input_by_rank
+                    if isinstance(model_input.idlist_features, KeyedJaggedTensor)
+                    or not only_kjt
+                ]
+            )
         else:
-            sparse_features = model_input_by_rank[0].idlist_features
-            assert isinstance(sparse_features, KeyedJaggedTensor)
-            inputs_batch.append([sparse_features])
+            assert (
+                isinstance(model_input_by_rank[0].idlist_features, KeyedJaggedTensor)
+                or not only_kjt
+            )
+            inputs_batch.append([model_input_by_rank[0]])
+
+    # If only_kjt is True, extract idlist_features from ModelInput objects
+    if only_kjt:
+        inputs_batch = [
+            [model_input.idlist_features for model_input in batch]
+            for batch in inputs_batch
+        ]
 
     # Transpose if train, as inputs_by_rank is currently in  [B X R] format
     inputs_by_rank = [
-        [sparse_features for sparse_features in sparse_features_rank]
-        for sparse_features_rank in zip(*inputs_batch)
+        list(model_inputs_rank) for model_inputs_rank in zip(*inputs_batch)
     ]
 
     return inputs_by_rank
@@ -435,8 +425,9 @@ def write_report(
         qps_gpu = int(num_requests / avg_dur_s_gpu)
 
         mem_str = ""
-        for memory_stats in benchmark_res.mem_stats:
-            mem_str += f"{memory_stats}\n"
+        for gpu_memory_stats in benchmark_res.gpu_mem_stats:
+            mem_str += f"{gpu_memory_stats}\n"
+        mem_str += f"{benchmark_res.cpu_mem_stats}\n"
 
         report_str += (
             f"{benchmark_res.short_name:40} "
@@ -497,11 +488,36 @@ def set_embedding_config(
 # pyre-ignore [24]
 def cmd_conf(func: Callable) -> Callable:
 
+    def _load_config_file(config_path: str, is_json: bool = False) -> Dict[str, Any]:
+        if not config_path:
+            return {}
+        try:
+            with open(config_path, "r") as f:
+                if is_json:
+                    return json.load(f) or {}
+                else:
+                    return yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.warning(f"Failed to load {'JSON' if is_json else 'YAML'} config because {e}. Proceeding without it.")
+            return {}
+
     # pyre-ignore [3]
     def wrapper() -> Any:
         sig = inspect.signature(func)
         parser = argparse.ArgumentParser(func.__doc__)
 
+        parser.add_argument(
+            "--yaml_config",
+            type=str,
+            default=None,
+            help="YAML config file for benchmarking",
+        )
+        parser.add_argument(
+            "--json_config",
+            type=str,
+            default=None,
+            help="JSON config file for benchmarking",
+        )
         # Add loglevel argument with current logger level as default
         parser.add_argument(
             "--loglevel",
@@ -509,6 +525,16 @@ def cmd_conf(func: Callable) -> Callable:
             default=logging._levelToName[logger.level],
             help="Set the logging level (e.g. info, debug, warning, error)",
         )
+
+        pre_args, _ = parser.parse_known_args()
+
+        # Load YAML and JSON configs, JSON overrides YAML
+        yaml_defaults: Dict[str, Any] = _load_config_file(pre_args.yaml_config, is_json=False) if pre_args.yaml_config else {}
+        json_defaults: Dict[str, Any] = _load_config_file(pre_args.json_config, is_json=True) if pre_args.json_config else {}
+        # Merge: JSON overrides YAML
+        merged_defaults = {**yaml_defaults, **json_defaults}
+
+        logger.info(f"Loaded config defaults: {merged_defaults}")
 
         seen_args = set()  # track all --<name> we've added
 
@@ -534,11 +560,17 @@ def cmd_conf(func: Callable) -> Callable:
                         ftype = non_none[0]
                         origin = get_origin(ftype)
 
-                # Handle default_factory value
-                default_value = (
-                    f.default_factory()  # pyre-ignore [29]
-                    if f.default_factory is not MISSING
-                    else f.default
+                # Handle default_factory value and allow config to override it
+                default_value = merged_defaults.get(
+                    arg_name,  # flat lookup
+                    merged_defaults.get(cls.__name__, {}).get(  # hierarchy lookup
+                        arg_name,
+                        (
+                            f.default_factory()  # pyre-ignore [29]
+                            if f.default_factory is not MISSING
+                            else f.default
+                        ),
+                    ),
                 )
 
                 arg_kwargs = {
@@ -549,6 +581,9 @@ def cmd_conf(func: Callable) -> Callable:
                 if origin in (list, List):
                     elem_type = get_args(ftype)[0]
                     arg_kwargs.update(nargs="*", type=elem_type)
+                elif ftype is bool:
+                    # Special handling for boolean arguments
+                    arg_kwargs.update(type=lambda x: x.lower() in ["true", "1", "yes"])
                 else:
                     arg_kwargs.update(type=ftype)
 
@@ -597,7 +632,7 @@ def init_argparse_and_args() -> argparse.Namespace:
 def transform_module(
     module: torch.nn.Module,
     device: torch.device,
-    inputs: List[KeyedJaggedTensor],
+    inputs: Union[List[ModelInput], List[KeyedJaggedTensor]],
     sharder: ModuleSharder[T],
     sharding_type: ShardingType,
     compile_mode: CompileMode,
@@ -724,13 +759,13 @@ def _run_benchmark_core(
             if reset_accumulated_memory_stats:
                 torch.cuda.reset_accumulated_memory_stats(rank)
 
-    # Optional allocator warm-up to create fragmentation similar to production
-    if pre_gpu_load and device_type == "cuda":
-        _tmp = torch.rand(16384, 16384, device="cuda")
-        for _ in range(pre_gpu_load):
-            _tmp = _tmp * torch.rand(16384, 16384, device="cuda")
+        # Optional allocator warm-up to create fragmentation similar to production
+        if pre_gpu_load:
+            _tmp = torch.rand(16384, 16384, device="cuda")
+            for _ in range(pre_gpu_load):
+                _tmp = _tmp * torch.rand(16384, 16384, device="cuda")
 
-    # Timing loop
+    # Timings
     start_events, end_events, times = [], [], []
 
     if device_type == "cuda":
@@ -740,11 +775,9 @@ def _run_benchmark_core(
         end_events = [
             torch.cuda.Event(enable_timing=True) for _ in range(num_benchmarks)
         ]
+        # Capture per-iteration active CPU cycles (excludes time the thread is truly idle/asleep) using `process_time_ns`.
         cpu_times_active_ns: List[int] = []
 
-        # Capture per-iteration *active* CPU cycles (excludes time the thread is
-        # truly idle) using ``process_time_ns``.
-        
         for i in range(num_benchmarks):
             # Ensure that outstanding GPU work from the previous iteration has
             # finished so that we do not attribute its wait time to the next
@@ -753,53 +786,48 @@ def _run_benchmark_core(
                 torch.cuda.synchronize(rank if rank >= 0 else 0)
 
             start_events[i].record()
-
             cpu_start_active_ns = time.process_time_ns()
-            run_iter_fn()
-            cpu_end_active_ns = time.process_time_ns()
 
+            run_iter_fn()
+
+            cpu_end_active_ns = time.process_time_ns()
+            end_events[i].record()
             cpu_times_active_ns.append(cpu_end_active_ns - cpu_start_active_ns)
 
-            end_events[i].record()
-
-        # Convert to milliseconds and drop the first iteration (acts as warm-up)
+        # Convert to milliseconds and drop the first iteration
         cpu_elapsed_time = torch.tensor(
             [t / 1e6 for t in cpu_times_active_ns[1:]], dtype=torch.float
         )
 
-        # Print raw CPU *active* timings for quick debugging/inspection
-        print(f"CPU active times (ms) for {name}: {cpu_elapsed_time.tolist()}")
-        # End of CPU timing modifications
-    else:
-        # For CPU-only benchmarks we fall back to wall-clock timing via ``timeit``.
-        times = timeit.repeat(run_iter_fn, number=1, repeat=num_benchmarks)
-        # ``process_time`` ~= wall time for pure-CPU path, so we use the same
-        # tensor for both metrics to keep downstream code simple.
-        cpu_elapsed_time = torch.tensor(times) * 1e3  # convert to ms
-
-    # Make sure all kernels are finished before reading timers / stats
-    if device_type == "cuda":
+        # Make sure all kernels are finished before reading timers / stats
         if rank == -1:
             for di in range(world_size):
                 torch.cuda.synchronize(di)
         else:
             torch.cuda.synchronize(rank)
 
-    # After timing loop – build elapsed time tensors
-    if device_type == "cuda":
-        gpu_elapsed_time = torch.tensor([
-            s.elapsed_time(e) for s, e in zip(start_events[1:], end_events[1:])
-        ])
+        gpu_elapsed_time = torch.tensor(
+            [s.elapsed_time(e) for s, e in zip(start_events[1:], end_events[1:])]
+        )
     else:
-        gpu_elapsed_time = cpu_elapsed_time.clone()  # no GPU, mirror CPU timings
+        # For CPU-only benchmarks we fall back to wall-clock timing via ``timeit``.
+        times = timeit.repeat(run_iter_fn, number=1, repeat=num_benchmarks)
+        cpu_elapsed_time = torch.tensor(times) * 1e3  # convert to ms
+
+        # mirror CPU timings for overall consistency
+        gpu_elapsed_time = cpu_elapsed_time.clone()
+
     # Memory statistics collection
-    mem_stats: List[MemoryStats] = []
+    gpu_mem_stats: List[GPUMemoryStats] = []
+    cpu_mem_stats = CPUMemoryStats.for_process()
+    
     if device_type == "cuda":
         if rank == -1:
             for di in range(world_size):
-                mem_stats.append(MemoryStats.for_device(di))
+                gpu_mem_stats.append(GPUMemoryStats.for_device(di))
         else:
-            mem_stats.append(MemoryStats.for_device(rank))
+            gpu_mem_stats.append(GPUMemoryStats.for_device(rank))
+    # CPU memory stats are collected for both GPU and CPU-only runs
 
     # Optional detailed profiling
     if output_dir and profile_iter_fn and device_type == "cuda":
@@ -845,7 +873,8 @@ def _run_benchmark_core(
         short_name=name,
         gpu_elapsed_time=gpu_elapsed_time,
         cpu_elapsed_time=cpu_elapsed_time,
-        mem_stats=mem_stats,
+        gpu_mem_stats=gpu_mem_stats,
+        cpu_mem_stats=cpu_mem_stats,
         rank=rank,
     )
 
@@ -853,9 +882,9 @@ def _run_benchmark_core(
 def benchmark(
     name: str,
     model: torch.nn.Module,
-    warmup_inputs: Union[List[KeyedJaggedTensor], List[Dict[str, Any]]],
-    bench_inputs: Union[List[KeyedJaggedTensor], List[Dict[str, Any]]],
-    prof_inputs: Union[List[KeyedJaggedTensor], List[Dict[str, Any]]],
+    warmup_inputs: Union[List[KeyedJaggedTensor], List[ModelInput], List[Dict[str, Any]]],
+    bench_inputs: Union[List[KeyedJaggedTensor], List[ModelInput], List[Dict[str, Any]]],
+    prof_inputs: Union[List[KeyedJaggedTensor], List[ModelInput], List[Dict[str, Any]]],
     world_size: int,
     output_dir: str,
     num_benchmarks: int,
@@ -971,9 +1000,9 @@ def init_module_and_run_benchmark(
     compile_mode: CompileMode,
     world_size: int,
     batch_size: int,
-    warmup_inputs: List[List[KeyedJaggedTensor]],
-    bench_inputs: List[List[KeyedJaggedTensor]],
-    prof_inputs: List[List[KeyedJaggedTensor]],
+    warmup_inputs: Union[List[List[ModelInput]], List[List[KeyedJaggedTensor]]],
+    bench_inputs: Union[List[List[ModelInput]], List[List[KeyedJaggedTensor]]],
+    prof_inputs: Union[List[List[ModelInput]], List[List[KeyedJaggedTensor]]],
     tables: Union[List[EmbeddingBagConfig], List[EmbeddingConfig]],
     output_dir: str,
     num_benchmarks: int,
@@ -1033,7 +1062,7 @@ def init_module_and_run_benchmark(
         module = transform_module(
             module=module,
             device=device,
-            inputs=warmup_inputs_cuda,
+            inputs=warmup_inputs_cuda,  # pyre-ignore[6]
             sharder=sharder,
             sharding_type=sharding_type,
             compile_mode=compile_mode,
@@ -1052,9 +1081,9 @@ def init_module_and_run_benchmark(
         res = benchmark(
             name,
             module,
-            warmup_inputs_cuda,
-            bench_inputs_cuda,
-            prof_inputs_cuda,
+            warmup_inputs_cuda,  # pyre-ignore[6]
+            bench_inputs_cuda,  # pyre-ignore[6]
+            prof_inputs_cuda,  # pyre-ignore[6]
             world_size=world_size,
             output_dir=output_dir,
             num_benchmarks=num_benchmarks,
@@ -1114,7 +1143,7 @@ def multi_process_benchmark(
         res = qq.get()
 
         benchmark_res_per_rank.append(res)
-        assert len(res.mem_stats) == 1
+        assert len(res.gpu_mem_stats) == 1
 
     for p in processes:
         p.join()
@@ -1124,13 +1153,17 @@ def multi_process_benchmark(
         short_name=benchmark_res_per_rank[0].short_name,
         gpu_elapsed_time=benchmark_res_per_rank[0].gpu_elapsed_time,
         cpu_elapsed_time=benchmark_res_per_rank[0].cpu_elapsed_time,
-        mem_stats=[MemoryStats(rank, 0, 0, 0) for rank in range(world_size)],
+        gpu_mem_stats=[GPUMemoryStats(rank, 0, 0, 0) for rank in range(world_size)],
+        cpu_mem_stats=CPUMemoryStats(0, 0),  # Will be updated below
         rank=0,
     )
 
     for res in benchmark_res_per_rank:
-        # Each rank's BenchmarkResult contains 1 memory measurement
-        total_benchmark_res.mem_stats[res.rank] = res.mem_stats[0]
+        # Each rank's BenchmarkResult contains 1 GPU memory measurement
+        total_benchmark_res.gpu_mem_stats[res.rank] = res.gpu_mem_stats[0]
+        # Use the CPU memory stats from the first rank (they should be similar across ranks)
+        if res.rank == 0:
+            total_benchmark_res.cpu_mem_stats = res.cpu_mem_stats
 
     return total_benchmark_res
 
@@ -1144,6 +1177,7 @@ def benchmark_module(
     warmup_iters: int = 20,
     bench_iters: int = 500,
     prof_iters: int = 20,
+    num_float_features: int = 0,
     batch_size: int = 2048,
     world_size: int = 2,
     num_benchmarks: int = 5,
@@ -1154,6 +1188,7 @@ def benchmark_module(
     pooling_configs: Optional[List[int]] = None,
     variable_batch_embeddings: bool = False,
     device_type: str = "cuda",
+    train: bool = True,
 ) -> List[BenchmarkResult]:
     """
     Args:
@@ -1188,19 +1223,10 @@ def benchmark_module(
     assert (
         num_benchmarks > 2
     ), "num_benchmarks needs to be greater than 2 for statistical analysis"
-    if isinstance(module, QuantEmbeddingBagCollection) or isinstance(
-        module, QuantEmbeddingCollection
-    ):
-        train = False
-    else:
-        train = True
 
     benchmark_results: List[BenchmarkResult] = []
 
-    if isinstance(tables[0], EmbeddingBagConfig):
-        wrapped_module = EBCWrapper(module)
-    else:
-        wrapped_module = ECWrapper(module)
+    wrapped_module = ModuleWrapper(module)
 
     num_inputs_to_gen: int = warmup_iters + bench_iters + prof_iters
     inputs = get_inputs(
@@ -1208,9 +1234,11 @@ def benchmark_module(
         batch_size,
         world_size,
         num_inputs_to_gen,
+        num_float_features,
         train,
         pooling_configs,
         variable_batch_embeddings,
+        only_kjt=True,
     )
 
     warmup_inputs = [rank_inputs[:warmup_iters] for rank_inputs in inputs]
@@ -1265,9 +1293,9 @@ def benchmark_module(
                     compile_mode=compile_mode,
                     world_size=world_size,
                     batch_size=batch_size,
-                    warmup_inputs=warmup_inputs,
-                    bench_inputs=bench_inputs,
-                    prof_inputs=prof_inputs,
+                    warmup_inputs=warmup_inputs,  # pyre-ignore[6]
+                    bench_inputs=bench_inputs,  # pyre-ignore[6]
+                    prof_inputs=prof_inputs,  # pyre-ignore[6]
                     tables=tables,
                     num_benchmarks=num_benchmarks,
                     output_dir=output_dir,
