@@ -190,15 +190,12 @@ class MultiProcessTestBase(unittest.TestCase):
             self.assertEqual(0, p.exitcode)
 
 
-def _wrapper_func_for_multiprocessing(queue, func, **kwargs):
-    """Wrapper function that calls the original func and puts result in queue"""
-    try:
-        result = func(**kwargs)
-        queue.put((kwargs["rank"], result))
-    except Exception as e:
-        # Put the exception in the queue so we can see what went wrong
-        queue.put((kwargs["rank"], e))
-        raise  # Re-raise so the process exits with non-zero code
+def _wrapper_func_for_multiprocessing(args):
+    """Wrapper function that unpacks arguments and calls the original func"""
+    func, rank, world_size, kwargs = args
+    kwargs["rank"] = rank
+    kwargs["world_size"] = world_size
+    return func(**kwargs)
 
 
 def run_multi_process_func(
@@ -230,44 +227,15 @@ def run_multi_process_func(
         result = func(**kwargs)
         return [result]
 
-    # Create a queue to collect results from each process
     ctx = multiprocessing.get_context(multiprocessing_method)
-    result_queue = ctx.Queue()
     
-    processes = []
-    for rank in range(world_size):
-        kwargs["rank"] = rank
-        kwargs["world_size"] = world_size
-        p = ctx.Process(
-            target=_wrapper_func_for_multiprocessing,
-            args=(result_queue, func),
-            name=f"rank{rank}",
-            kwargs=kwargs,
-        )
-        p.start()
-        processes.append(p)
-
-    # Wait for all processes to complete
-    for p in processes:
-        p.join()
-        if p.exitcode != 0:
-            raise RuntimeError(f"Process {p.name} failed with exit code {p.exitcode}")
-
-    # Collect results from queue
-    results = []
-    for i in range(world_size):
-        try:
-            # Use get with timeout instead of get_nowait for more robust operation
-            rank, result = result_queue.get(timeout=10.0)
-            # Check if the result is actually an exception from the process
-            if isinstance(result, Exception):
-                raise RuntimeError(f"Process rank {rank} failed with exception: {result}")
-            results.append((rank, result))
-        except queue.Empty:
-            raise RuntimeError(f"Timeout waiting for result {i+1}/{world_size} from queue - process may have hung")
-        except Exception as e:
-            raise RuntimeError(f"Failed to get result {i+1}/{world_size} from queue: {e}")
+    # Prepare arguments for each process
+    args_list = [
+        (func, rank, world_size, kwargs.copy())
+        for rank in range(world_size)
+    ]
     
-    # Sort by rank to maintain order and extract just the result values
-    results.sort(key=lambda x: x[0])
-    return [result for rank, result in results]
+    with ctx.Pool(processes=world_size) as pool:
+        results = pool.map(_wrapper_func_for_multiprocessing, args_list)
+    
+    return results
