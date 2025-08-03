@@ -1,0 +1,31 @@
+# Example YAML configuration for module-level benchmarking of DLRM
+# This demonstrates how to benchmark DLRM with dynamic importing
+
+benchmark_type: "module"
+
+run_options:
+  world_size: 2
+  num_batches: 10
+  sharding_type: "TABLE_WISE"
+  compute_kernel: "FUSED"
+  planner_type: "embedding"
+  dense_optimizer: "SGD"
+  dense_lr: 0.1
+  sparse_optimizer: "EXACT_ADAGRAD"
+  sparse_lr: 0.1
+
+table_config:
+  num_unweighted_features: 26 # DLRM has 26 categorical features
+  num_weighted_features: 0 # DLRM doesn't use weighted features
+  embedding_feature_dim: 128
+
+module_config:
+  module_path: "torchrec.models.dlrm"
+  class_name: "DLRMWrapper"
+  requires_tables: true
+  requires_weighted_tables: false
+  requires_dense_device: true # DLRM needs dense_device parameter
+  constructor_args:
+    dense_in_features: 13 # DLRM has 13 dense features
+    dense_arch_layer_sizes: [512, 256, 128] # Dense bottom MLP layers
+    over_arch_layer_sizes: [512, 256, 1] # Dense top MLP layers

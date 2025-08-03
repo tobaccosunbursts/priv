@@ -1,0 +1,29 @@
+# Example YAML configuration for benchmarking a custom module
+# This shows how to benchmark any PyTorch module with flexible configuration
+
+benchmark_type: "module"
+
+run_options:
+  world_size: 4 # Scale up for larger benchmarks
+  num_batches: 20
+  sharding_type: "ROW_WISE" # Different sharding strategy
+  compute_kernel: "FUSED"
+  planner_type: "hetero" # Use heterogeneous planner
+  dense_optimizer: "Adam" # Different optimizer
+  dense_lr: 0.001
+  sparse_optimizer: "EXACT_ADAGRAD"
+  sparse_lr: 0.1
+
+table_config:
+  num_unweighted_features: 50
+  num_weighted_features: 25
+  embedding_feature_dim: 256 # Larger embedding dimension
+
+module_config:
+  module_path: "torchrec.modules.embedding_modules"
+  class_name: "EmbeddingBagCollection"
+  requires_tables: true
+  requires_weighted_tables: false
+  requires_dense_device: false
+  constructor_args:
+    device: "meta" # Use meta device for initialization

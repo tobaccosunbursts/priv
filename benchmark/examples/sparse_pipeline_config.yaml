@@ -1,0 +1,39 @@
+# Example YAML configuration for pipeline-level benchmarking
+# This demonstrates how to benchmark training pipelines with existing model configurations
+
+benchmark_type: "pipeline"
+
+run_options:
+  world_size: 2
+  num_batches: 10
+  sharding_type: "TABLE_WISE"
+  compute_kernel: "FUSED"
+  planner_type: "embedding"
+  dense_optimizer: "SGD"
+  dense_lr: 0.1
+  dense_momentum: 0.9
+  sparse_optimizer: "EXACT_ADAGRAD"
+  sparse_lr: 0.1
+  export_stacks: false
+
+table_config:
+  num_unweighted_features: 100
+  num_weighted_features: 100
+  embedding_feature_dim: 128
+
+pipeline_config:
+  pipeline: "sparse" # base, sparse, fused, semi, prefetch
+  emb_lookup_stream: "data_dist" # Stream for embedding lookups
+  apply_jit: false # Whether to apply JIT compilation
+
+model_selection:
+  model_name: "test_sparse_nn" # test_sparse_nn, deepfm, dlrm, etc.
+  batch_size: 8192
+  num_float_features: 10
+  feature_pooling_avg: 10
+  use_offsets: false
+  long_kjt_indices: true
+  long_kjt_offsets: true
+  long_kjt_lengths: true
+  pin_memory: true
+  # Additional model-specific parameters can be added here

@@ -1,0 +1,31 @@
+# Example YAML configuration for module-level benchmarking of DeepFM
+# This demonstrates how to benchmark a specific PyTorch module with dynamic importing
+
+benchmark_type: "module"
+
+run_options:
+  world_size: 2
+  num_batches: 10
+  sharding_type: "TABLE_WISE" # TABLE_WISE, ROW_WISE, COLUMN_WISE, etc.
+  compute_kernel: "FUSED" # FUSED, DENSE, etc.
+  planner_type: "embedding" # embedding, hetero
+  dense_optimizer: "SGD"
+  dense_lr: 0.1
+  sparse_optimizer: "EXACT_ADAGRAD"
+  sparse_lr: 0.1
+
+table_config:
+  num_unweighted_features: 26 # DLRM has 26 categorical features
+  num_weighted_features: 0 # DeepFM typically doesn't use weighted features
+  embedding_feature_dim: 128
+
+module_config:
+  module_path: "torchrec.models.deepfm"
+  class_name: "SimpleDeepFMNNWrapper"
+  requires_tables: true # This module needs embedding tables
+  requires_weighted_tables: false # This module doesn't need weighted tables
+  requires_dense_device: false # Dense device will be set during sharding
+  constructor_args:
+    num_dense_features: 13 # DLRM has 13 dense features
+    hidden_layer_size: 512 # Hidden layer size for the deep part
+    deep_fm_dimension: 16 # Factorization dimension

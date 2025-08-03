@@ -1,0 +1,27 @@
+# Simple test configuration for verifying the unified benchmark system works
+# This uses a basic PyTorch Linear layer to test the dynamic import functionality
+
+benchmark_type: "module"
+
+run_options:
+  world_size: 1 # Single process for simple testing
+  num_batches: 3 # Just a few batches for quick test
+  sharding_type: "TABLE_WISE"
+  compute_kernel: "FUSED"
+  planner_type: "embedding"
+
+table_config:
+  num_unweighted_features: 5 # Small number for testing
+  num_weighted_features: 0
+  embedding_feature_dim: 32 # Small embedding dim for quick execution
+
+module_config:
+  module_path: "torch.nn"
+  class_name: "Linear"
+  requires_tables: false # Linear layer doesn't need embedding tables
+  requires_weighted_tables: false
+  requires_dense_device: false
+  constructor_args:
+    in_features: 32
+    out_features: 1
+    bias: true
