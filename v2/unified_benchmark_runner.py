@@ -74,6 +74,7 @@ from torchrec.distributed.benchmark.benchmark_train_pipeline import (
     RunOptions,
     UnifiedBenchmarkConfig,
     run_module_benchmark,
+    run_function_benchmark,
     run_pipeline,
 )
 from torchrec.distributed.benchmark.benchmark_pipeline_utils import (
@@ -115,6 +116,14 @@ def main(
         result = run_module_benchmark(unified_config, table_config, run_option)
         print(f"Module benchmark completed: {result}")
         
+    elif unified_config.benchmark_type == "function":
+        # Run function-level benchmark
+        if not unified_config.function_path or not unified_config.function_name:
+            raise ValueError("For function benchmarking, both function_path and function_name must be specified")
+        
+        result = run_function_benchmark(unified_config, table_config, run_option)
+        print(f"Function benchmark completed: {result}")
+        
     elif unified_config.benchmark_type == "pipeline":
         # Run pipeline-level benchmark
         if model_selection is None:
@@ -154,7 +163,7 @@ def main(
         print(f"Pipeline benchmark completed with {len(results)} results")
         
     else:
-        raise ValueError(f"Unknown benchmark_type: {unified_config.benchmark_type}. Must be 'module' or 'pipeline'")
+        raise ValueError(f"Unknown benchmark_type: {unified_config.benchmark_type}. Must be 'module', 'function', or 'pipeline'")
 
 
 if __name__ == "__main__":
