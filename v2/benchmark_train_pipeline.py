@@ -47,6 +47,7 @@ from torchrec.distributed.benchmark.benchmark_utils import (
     generate_sharded_model_and_optimizer,
     generate_tables,
     ModuleBenchmarkConfig,
+    multi_process_benchmark,
 )
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -65,17 +66,24 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 @dataclass
 class UnifiedBenchmarkConfig:
-    """Unified configuration for both pipeline and module benchmarking."""
-    benchmark_type: str = "pipeline"  # "pipeline" or "module"
+    """Unified configuration for pipeline, module, and function benchmarking."""
+    benchmark_type: str = "pipeline"  # "pipeline", "module", or "function"
     
     # Module benchmarking specific options
     module_path: str = ""  # e.g., "torchrec.models.deepfm"
     module_class: str = ""  # e.g., "SimpleDeepFMNNWrapper"
     module_kwargs: Optional[Dict[str, Any]] = None  # Additional kwargs for module instantiation
+    
+    # Function benchmarking specific options
+    function_path: str = ""  # e.g., "torchrec.distributed.model_tracker.model_delta_tracker"
+    function_name: str = ""  # e.g., "ModelDeltaTracker"
+    function_kwargs: Optional[Dict[str, Any]] = None  # Additional kwargs for function setup
 
     def __post_init__(self):
         if self.module_kwargs is None:
             self.module_kwargs = {}
+        if self.function_kwargs is None:
+            self.function_kwargs = {}
 
 
 @dataclass
@@ -302,6 +310,55 @@ def run_module_benchmark(
     )
 
 
+def run_function_benchmark(
+    unified_config: UnifiedBenchmarkConfig,
+    table_config: EmbeddingTablesConfig,
+    run_option: RunOptions,
+) -> BenchmarkResult:
+    """Run function-level benchmarking."""
+    import importlib
+    from torchrec.distributed.test_utils.multi_process import MultiProcessContext
+    from torchrec.distributed.benchmark.benchmark_utils import benchmark_func, multi_process_benchmark
+    
+    module = importlib.import_module(unified_config.function_path)
+    FunctionClass = getattr(module, unified_config.function_name)
+    
+    def _run_benchmark(rank: int, world_size: int, **kwargs) -> BenchmarkResult:
+        from torchrec.distributed.test_utils.test_input import ModelInput
+        with MultiProcessContext(rank=rank, world_size=world_size, backend="nccl") as ctx:
+            tables, weighted_tables = generate_tables(table_config.num_unweighted_features, table_config.num_weighted_features, table_config.embedding_feature_dim)
+            test_inputs = [ModelInput.generate(batch_size=2048, tables=tables, weighted_tables=weighted_tables, num_float_features=0, device=ctx.device) for _ in range(5)]
+            
+            if unified_config.function_name == "ModelDeltaTracker":
+                from torchrec.modules.embedding_modules import EmbeddingBagCollection
+                from torchrec.distributed.model_tracker.types import TrackingMode
+                
+                model = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
+                sharded_model, _ = generate_sharded_model_and_optimizer(
+                    model, run_option.sharding_type.value, run_option.compute_kernel.value,
+                    ctx.pg, ctx.device, {"optimizer": "SGD", "learning_rate": 0.1}
+                )
+                tracker = FunctionClass(model=sharded_model, tracking_mode=TrackingMode.ID_ONLY)
+                
+                return benchmark_func(
+                    name="ModelDeltaTracker", bench_inputs=test_inputs, prof_inputs=test_inputs[:2],
+                    num_benchmarks=5, num_profiles=2, profile_dir="", world_size=world_size,
+                    func_to_benchmark=lambda inputs, model, tracker: [model(inp.idlist_features) or tracker.step() or tracker.get_delta_ids() for inp in inputs],
+                    benchmark_func_kwargs={"model": sharded_model, "tracker": tracker}, rank=rank
+                )
+            else:
+                func_instance = FunctionClass(**(unified_config.function_kwargs or {}))
+                return benchmark_func(
+                    name=unified_config.function_name, bench_inputs=test_inputs, prof_inputs=test_inputs[:2],
+                    num_benchmarks=5, num_profiles=2, profile_dir="", world_size=world_size,
+                    func_to_benchmark=lambda inputs, instance: [getattr(instance, '__call__', getattr(instance, 'step', lambda x: None))(inp) for inp in inputs],
+                    benchmark_func_kwargs={"instance": func_instance}, rank=rank
+                )
+    
+    return multi_process_benchmark(callable=_run_benchmark, world_size=run_option.world_size)
+
+
+
 @cmd_conf
 def main(
     run_option: RunOptions,
@@ -316,6 +373,10 @@ def main(
         print("Running module-level benchmark...")
         result = run_module_benchmark(unified_config, table_config, run_option)
         print(f"Module benchmark completed: {result}")
+    elif unified_config.benchmark_type == "function":
+        print("Running function-level benchmark...")
+        result = run_function_benchmark(unified_config, table_config, run_option)
+        print(f"Function benchmark completed: {result}")
     elif unified_config.benchmark_type == "pipeline":
         print("Running pipeline-level benchmark...")
         tables, weighted_tables = generate_tables(
@@ -360,7 +421,7 @@ def main(
             pipeline_config=pipeline_config,
         )
     else:
-        raise ValueError(f"Unknown benchmark_type: {unified_config.benchmark_type}. Must be 'module' or 'pipeline'")
+        raise ValueError(f"Unknown benchmark_type: {unified_config.benchmark_type}. Must be 'module', 'function', or 'pipeline'")
 
 
 def run_pipeline(
