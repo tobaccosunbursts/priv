@@ -1,0 +1,27 @@
+# Example YAML configuration for function-level benchmarking (ModelDeltaTracker)
+# Usage: python -m torchrec.distributed.benchmark.unified_benchmark_runner --yaml_config=function_benchmark_config.yaml
+
+UnifiedBenchmarkConfig:
+  benchmark_type: "function"
+  function_path: "torchrec.distributed.model_tracker.model_delta_tracker"
+  function_name: "ModelDeltaTracker"
+  function_kwargs:
+    delete_on_read: true
+    auto_compact: false
+    consumers: ["consumer_a", "consumer_b"]
+
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  sharding_type: "TABLE_WISE"
+  compute_kernel: "FUSED"
+  planner_type: "embedding"
+  dense_optimizer: "SGD"
+  dense_lr: 0.1
+  sparse_optimizer: "EXACT_ADAGRAD"
+  sparse_lr: 0.1
+
+EmbeddingTablesConfig:
+  num_unweighted_features: 50
+  num_weighted_features: 0
+  embedding_feature_dim: 64
