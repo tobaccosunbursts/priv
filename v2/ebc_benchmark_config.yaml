@@ -1,0 +1,27 @@
+# Example YAML configuration for benchmarking EmbeddingBagCollection directly
+# Usage: python -m torchrec.distributed.benchmark.unified_benchmark_runner --yaml_config=ebc_benchmark_config.yaml
+
+UnifiedBenchmarkConfig:
+  benchmark_type: "module"
+  module_path: "torchrec.modules.embedding_modules"
+  module_class: "EmbeddingBagCollection"
+  module_kwargs:
+    # Additional kwargs for EmbeddingBagCollection can be added here
+    device: "meta"
+
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  sharding_type: "TABLE_WISE"
+  compute_kernel: "FUSED"
+  input_type: "kjt"
+  planner_type: "embedding"
+  dense_optimizer: "SGD"
+  dense_lr: 0.1
+  sparse_optimizer: "EXACT_ADAGRAD"
+  sparse_lr: 0.1
+
+EmbeddingTablesConfig:
+  num_unweighted_features: 50
+  num_weighted_features: 0
+  embedding_feature_dim: 64
