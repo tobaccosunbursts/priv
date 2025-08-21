@@ -892,22 +892,29 @@ def _convert_value(value: Any, field_type: Any) -> Any:
     if value is None:
         return value
         
-    # Handle enums
-    if isinstance(field_type, type) and issubclass(field_type, Enum):
-        # If already the right enum type, return as-is
-        if isinstance(value, field_type):
-            return value
-        # Convert string to enum
-        if isinstance(value, str):
-            try:
-                return field_type(value)
-            except ValueError:
+    # Handle enums with better error handling and debugging
+    try:
+        if isinstance(field_type, type) and issubclass(field_type, Enum):
+            # If already the right enum type, return as-is
+            if isinstance(value, field_type):
+                return value
+            # Convert string to enum
+            if isinstance(value, str):
                 try:
-                    return field_type[value.upper()]
-                except KeyError:
-                    raise ValueError(f"Invalid enum value '{value}' for {field_type.__name__}. Valid values: {[e.value for e in field_type]}")
-        else:
-            raise ValueError(f"Cannot convert {type(value)} to {field_type.__name__}")
+                    return field_type(value)
+                except ValueError:
+                    try:
+                        return field_type[value.upper()]
+                    except KeyError:
+                        raise ValueError(f"Invalid enum value '{value}' for {field_type.__name__}. Valid values: {[e.value for e in field_type]}")
+                except Exception as e:
+                    raise RuntimeError(f"Error calling {field_type.__name__}('{value}'): {e}. Type: {type(field_type)}, Is callable: {callable(field_type)}")
+            else:
+                raise ValueError(f"Cannot convert {type(value)} to {field_type.__name__}")
+    except TypeError as e:
+        # This happens when field_type is not actually a type or enum
+        logger.debug(f"Type error in _convert_value for field_type={field_type}, value={value}: {e}")
+        pass
     
     # Handle bools
     if field_type is bool and isinstance(value, str):
@@ -951,7 +958,10 @@ def cmd_conf(func: Callable) -> Callable:
                 config_value = _get_config_value(arg_name, config_data, cls.__name__)
                 if config_value is not None:
                     field_type = _unwrap_optional(field_info.type)
-                    default_value = _convert_value(config_value, field_type)
+                    try:
+                        default_value = _convert_value(config_value, field_type)
+                    except Exception as e:
+                        raise RuntimeError(f"Error converting config value '{config_value}' for field '{arg_name}' of type {field_type}: {e}")
                 elif field_info.default is not MISSING:
                     default_value = field_info.default
                 elif field_info.default_factory is not MISSING:
@@ -968,11 +978,17 @@ def cmd_conf(func: Callable) -> Callable:
                     is_enum = False
                     
                 if is_enum:
+                    try:
+                        choices = [e.value for e in field_type]
+                        default_str = default_value.value if hasattr(default_value, 'value') else str(default_value)
+                    except Exception as e:
+                        raise RuntimeError(f"Error processing enum {field_type} for field {arg_name}: {e}. field_type type: {type(field_type)}")
+                    
                     parser.add_argument(
                         f"--{arg_name}",
                         type=str,
-                        default=default_value.value if hasattr(default_value, 'value') else str(default_value),
-                        choices=[e.value for e in field_type],
+                        default=default_str,
+                        choices=choices,
                         help=f"({cls.__name__}) {arg_name}"
                     )
                 elif field_type is bool:
@@ -1016,8 +1032,12 @@ def cmd_conf(func: Callable) -> Callable:
                 field_type = _unwrap_optional(field_info.type)
                 data[field_info.name] = _convert_value(value, field_type)
             
-            kwargs[param_name] = cls(**data)
-            logger.info(f"{cls.__name__}: {kwargs[param_name]}")
+            try:
+                kwargs[param_name] = cls(**data)
+                logger.info(f"{cls.__name__}: {kwargs[param_name]}")
+            except Exception as e:
+                logger.error(f"Error creating {cls.__name__} instance with data {data}: {e}")
+                raise
         
         return func(**kwargs)
     
