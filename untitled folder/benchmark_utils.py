@@ -864,152 +864,113 @@ def _load_config_file(config_path: str, is_json: bool = False) -> Dict[str, Any]
         return {}
 
 
-def _get_default_value(field_info: Any, config_data: Dict[str, Any], cls_name: str) -> Any:
-    """Get default value for a dataclass field from config or field default."""
-    arg_name = field_info.name
-    
-    # Try hierarchical lookup: class_name.field_name
-    snake_case_class_name = ''.join(['_' + c.lower() if c.isupper() else c for c in cls_name]).lstrip('_')
-    
+def _get_config_value(field_name: str, config_data: Dict[str, Any], cls_name: str) -> Any:
+    """Get config value with simple hierarchical lookup."""
     # Check nested config structure first
-    for class_key in [snake_case_class_name, cls_name.lower(), cls_name]:
-        if class_key in config_data and arg_name in config_data[class_key]:
-            return config_data[class_key][arg_name]
+    snake_case_name = ''.join(['_' + c.lower() if c.isupper() else c for c in cls_name]).lstrip('_')
+    for class_key in [snake_case_name, cls_name.lower()]:
+        if class_key in config_data and field_name in config_data[class_key]:
+            return config_data[class_key][field_name]
     
     # Check flat structure
-    if arg_name in config_data:
-        return config_data[arg_name]
-    
-    # Use field default
-    if field_info.default_factory is not MISSING:
-        return field_info.default_factory()
-    return field_info.default
+    return config_data.get(field_name)
 
 
-def _get_field_type_info(field_type: Any) -> Tuple[Any, Any]:
-    """Extract the actual type and origin from a field type, handling Optional."""
+def _unwrap_optional(field_type: Any) -> Any:
+    """Unwrap Optional[X] to X."""
     origin = get_origin(field_type)
-    
-    # Handle Optional[X] -> X
     if origin is Union and type(None) in get_args(field_type):
         non_none_types = [t for t in get_args(field_type) if t is not type(None)]
         if len(non_none_types) == 1:
-            field_type = non_none_types[0]
-            origin = get_origin(field_type)
-    
-    return field_type, origin
+            return non_none_types[0]
+    return field_type
 
 
-def _create_argument_parser_kwargs(field_type: Any, origin: Any, default_value: Any, cls_name: str, field_name: str) -> Dict[str, Any]:
-    """Create kwargs for argparse.add_argument based on field type."""
-    arg_kwargs = {
-        "default": default_value,
-        "help": f"({cls_name}) {field_name}",
-    }
+def _convert_value(value: Any, field_type: Any) -> Any:
+    """Convert a value to the target field type."""
+    # Handle enums
+    if isinstance(field_type, type) and issubclass(field_type, Enum):
+        if isinstance(value, str):
+            try:
+                return field_type(value)
+            except ValueError:
+                return field_type[value.upper()]
+        return value
     
-    if origin in (list, List):
-        elem_type = get_args(field_type)[0]
-        arg_kwargs.update(nargs="*", type=elem_type)
-    elif field_type is bool:
-        arg_kwargs.update(type=lambda x: x.lower() in ["true", "1", "yes"])
-    elif isinstance(field_type, type) and issubclass(field_type, Enum):
-        # Simple approach: just use the enum class directly as the type
-        # This should work because Enum classes are callable
-        arg_kwargs.update(type=field_type)
-    else:
-        arg_kwargs.update(type=field_type)
+    # Handle bools
+    if field_type is bool and isinstance(value, str):
+        return value.lower() in ["true", "1", "yes"]
     
-    return arg_kwargs
+    return value
 
 
-def _build_dataclass_from_args(cls: Any, args: argparse.Namespace) -> Any:
-    """Build a dataclass instance from parsed arguments."""
-    data = {}
-    for field_info in fields(cls):
-        value = getattr(args, field_info.name)
-        
-        # Handle enum conversion for fields that were parsed as strings
-        original_field_type = field_info.type
-        if hasattr(original_field_type, '__origin__'):  # Handle Optional[Enum]
-            args_types = get_args(original_field_type)
-            if len(args_types) == 2 and type(None) in args_types:
-                original_field_type = next(arg for arg in args_types if arg is not type(None))
-        
-        if isinstance(original_field_type, type) and issubclass(original_field_type, Enum):
-            if isinstance(value, str):
-                value = original_field_type(value)
-        
-        data[field_info.name] = value
-    
-    return cls(**data)
+
 
 
 def cmd_conf(func: Callable) -> Callable:
-    """
-    Simplified command-line configuration decorator.
-    
-    This decorator automatically creates command-line arguments for all dataclass
-    parameters of the decorated function and supports loading defaults from YAML/JSON files.
-    """
+    """Simple command-line configuration decorator."""
     def wrapper() -> Any:
-        sig = inspect.signature(func)
         parser = argparse.ArgumentParser(description=func.__doc__)
-        
-        # Add config file arguments
         parser.add_argument("--yaml_config", type=str, help="YAML config file path")
         parser.add_argument("--json_config", type=str, help="JSON config file path")
-        parser.add_argument(
-            "--loglevel", 
-            type=str, 
-            default="INFO",
-            help="Set the logging level (DEBUG, INFO, WARNING, ERROR)"
-        )
+        parser.add_argument("--loglevel", type=str, default="INFO", help="Logging level")
         
         # Parse config files first
         pre_args, _ = parser.parse_known_args()
         
-        yaml_config = _load_config_file(pre_args.yaml_config, is_json=False)
-        json_config = _load_config_file(pre_args.json_config, is_json=True)
-        merged_config = {**yaml_config, **json_config}  # JSON overrides YAML
+        yaml_config = _load_config_file(pre_args.yaml_config, is_json=False) if pre_args.yaml_config else {}
+        json_config = _load_config_file(pre_args.json_config, is_json=True) if pre_args.json_config else {}
+        config_data = {**yaml_config, **json_config}  # JSON overrides YAML
         
-        # Add arguments for each dataclass parameter
+        # Add command-line arguments for each dataclass field
         seen_args = set()
-        for param_name, param in sig.parameters.items():
-            cls = param.annotation
-            if not is_dataclass(cls):
+        for param_name, param in inspect.signature(func).parameters.items():
+            if not is_dataclass(param.annotation):
                 continue
-            
+                
+            cls = param.annotation
             for field_info in fields(cls):
                 arg_name = field_info.name
                 if arg_name in seen_args:
-                    logger.warning(f"Duplicate argument: {arg_name}")
                     continue
                 seen_args.add(arg_name)
                 
-                field_type, origin = _get_field_type_info(field_info.type)
-                default_value = _get_default_value(field_info, merged_config, cls.__name__)
-                
-                # Special handling for enums - check the original field type
-                original_field_type = field_info.type
-                if hasattr(original_field_type, '__origin__'):  # Handle Optional[Enum]
-                    args = get_args(original_field_type)
-                    if len(args) == 2 and type(None) in args:
-                        original_field_type = next(arg for arg in args if arg is not type(None))
-                
-                # If it's an enum, use a simple string type and handle conversion later
-                if isinstance(original_field_type, type) and issubclass(original_field_type, Enum):
-                    arg_kwargs = {
-                        "default": default_value.value if hasattr(default_value, 'value') else str(default_value),
-                        "help": f"({cls.__name__}) {field_info.name}",
-                        "type": str,
-                        "choices": [e.value for e in original_field_type],
-                    }
+                # Get default from config or field default
+                config_value = _get_config_value(arg_name, config_data, cls.__name__)
+                if config_value is not None:
+                    field_type = _unwrap_optional(field_info.type)
+                    default_value = _convert_value(config_value, field_type)
+                elif field_info.default is not MISSING:
+                    default_value = field_info.default
+                elif field_info.default_factory is not MISSING:
+                    default_value = field_info.default_factory()
                 else:
-                    arg_kwargs = _create_argument_parser_kwargs(
-                        field_type, origin, default_value, cls.__name__, field_info.name
-                    )
+                    default_value = None
                 
-                parser.add_argument(f"--{arg_name}", **arg_kwargs)
+                # Add argument to parser
+                field_type = _unwrap_optional(field_info.type)
+                if isinstance(field_type, type) and issubclass(field_type, Enum):
+                    parser.add_argument(
+                        f"--{arg_name}",
+                        type=str,
+                        default=default_value.value if hasattr(default_value, 'value') else str(default_value),
+                        choices=[e.value for e in field_type],
+                        help=f"({cls.__name__}) {arg_name}"
+                    )
+                elif field_type is bool:
+                    parser.add_argument(
+                        f"--{arg_name}",
+                        type=lambda x: x.lower() in ["true", "1", "yes"],
+                        default=default_value,
+                        help=f"({cls.__name__}) {arg_name}"
+                    )
+                else:
+                    parser.add_argument(
+                        f"--{arg_name}",
+                        type=field_type,
+                        default=default_value,
+                        help=f"({cls.__name__}) {arg_name}"
+                    )
         
         # Parse all arguments
         args = parser.parse_args()
@@ -1020,12 +981,20 @@ def cmd_conf(func: Callable) -> Callable:
         
         # Build dataclass instances
         kwargs = {}
-        for param_name, param in sig.parameters.items():
+        for param_name, param in inspect.signature(func).parameters.items():
+            if not is_dataclass(param.annotation):
+                continue
+                
             cls = param.annotation
-            if is_dataclass(cls):
-                config_instance = _build_dataclass_from_args(cls, args)
-                kwargs[param_name] = config_instance
-                logger.info(f"{cls.__name__}: {config_instance}")
+            data = {}
+            
+            for field_info in fields(cls):
+                value = getattr(args, field_info.name)
+                field_type = _unwrap_optional(field_info.type)
+                data[field_info.name] = _convert_value(value, field_type)
+            
+            kwargs[param_name] = cls(**data)
+            logger.info(f"{cls.__name__}: {kwargs[param_name]}")
         
         return func(**kwargs)
     
