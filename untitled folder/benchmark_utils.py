@@ -888,14 +888,26 @@ def _unwrap_optional(field_type: Any) -> Any:
 
 def _convert_value(value: Any, field_type: Any) -> Any:
     """Convert a value to the target field type."""
+    # If value is None, return as-is
+    if value is None:
+        return value
+        
     # Handle enums
     if isinstance(field_type, type) and issubclass(field_type, Enum):
+        # If already the right enum type, return as-is
+        if isinstance(value, field_type):
+            return value
+        # Convert string to enum
         if isinstance(value, str):
             try:
                 return field_type(value)
             except ValueError:
-                return field_type[value.upper()]
-        return value
+                try:
+                    return field_type[value.upper()]
+                except KeyError:
+                    raise ValueError(f"Invalid enum value '{value}' for {field_type.__name__}. Valid values: {[e.value for e in field_type]}")
+        else:
+            raise ValueError(f"Cannot convert {type(value)} to {field_type.__name__}")
     
     # Handle bools
     if field_type is bool and isinstance(value, str):
@@ -949,7 +961,13 @@ def cmd_conf(func: Callable) -> Callable:
                 
                 # Add argument to parser
                 field_type = _unwrap_optional(field_info.type)
-                if isinstance(field_type, type) and issubclass(field_type, Enum):
+                try:
+                    is_enum = isinstance(field_type, type) and issubclass(field_type, Enum)
+                except TypeError:
+                    # Handle case where field_type is not a class
+                    is_enum = False
+                    
+                if is_enum:
                     parser.add_argument(
                         f"--{arg_name}",
                         type=str,
@@ -965,9 +983,14 @@ def cmd_conf(func: Callable) -> Callable:
                         help=f"({cls.__name__}) {arg_name}"
                     )
                 else:
+                    # For non-enum, non-bool types, use the type directly but handle special cases
+                    arg_type = field_type
+                    if isinstance(field_type, type) and issubclass(field_type, Enum):
+                        # This shouldn't happen due to the check above, but just in case
+                        arg_type = str
                     parser.add_argument(
                         f"--{arg_name}",
-                        type=field_type,
+                        type=arg_type,
                         default=default_value,
                         help=f"({cls.__name__}) {arg_name}"
                     )
