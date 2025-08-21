@@ -848,156 +848,166 @@ def benchmark_module(
     return res
 
 
-# pyre-ignore [24]
+def _load_config_file(config_path: str, is_json: bool = False) -> Dict[str, Any]:
+    """Load configuration from YAML or JSON file."""
+    if not config_path:
+        return {}
+    
+    try:
+        with open(config_path, "r") as f:
+            if is_json:
+                return json.load(f) or {}
+            else:
+                return yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"Failed to load config from {config_path}: {e}. Proceeding without it.")
+        return {}
+
+
+def _get_default_value(field_info: Any, config_data: Dict[str, Any], cls_name: str) -> Any:
+    """Get default value for a dataclass field from config or field default."""
+    arg_name = field_info.name
+    
+    # Try hierarchical lookup: class_name.field_name
+    snake_case_class_name = ''.join(['_' + c.lower() if c.isupper() else c for c in cls_name]).lstrip('_')
+    
+    # Check nested config structure first
+    for class_key in [snake_case_class_name, cls_name.lower(), cls_name]:
+        if class_key in config_data and arg_name in config_data[class_key]:
+            return config_data[class_key][arg_name]
+    
+    # Check flat structure
+    if arg_name in config_data:
+        return config_data[arg_name]
+    
+    # Use field default
+    if field_info.default_factory is not MISSING:
+        return field_info.default_factory()
+    return field_info.default
+
+
+def _get_field_type_info(field_type: Any) -> Tuple[Any, Any]:
+    """Extract the actual type and origin from a field type, handling Optional."""
+    origin = get_origin(field_type)
+    
+    # Handle Optional[X] -> X
+    if origin is Union and type(None) in get_args(field_type):
+        non_none_types = [t for t in get_args(field_type) if t is not type(None)]
+        if len(non_none_types) == 1:
+            field_type = non_none_types[0]
+            origin = get_origin(field_type)
+    
+    return field_type, origin
+
+
+def _create_argument_parser_kwargs(field_type: Any, origin: Any, default_value: Any, cls_name: str, field_name: str) -> Dict[str, Any]:
+    """Create kwargs for argparse.add_argument based on field type."""
+    arg_kwargs = {
+        "default": default_value,
+        "help": f"({cls_name}) {field_name}",
+    }
+    
+    if origin in (list, List):
+        elem_type = get_args(field_type)[0]
+        arg_kwargs.update(nargs="*", type=elem_type)
+    elif field_type is bool:
+        arg_kwargs.update(type=lambda x: x.lower() in ["true", "1", "yes"])
+    elif hasattr(field_type, '__bases__') and Enum in field_type.__bases__:
+        def enum_converter(x: Any) -> Any:
+            return field_type(x) if isinstance(x, str) else x
+        arg_kwargs.update(type=enum_converter)
+    else:
+        arg_kwargs.update(type=field_type)
+    
+    return arg_kwargs
+
+
+def _build_dataclass_from_args(cls: Any, args: argparse.Namespace) -> Any:
+    """Build a dataclass instance from parsed arguments."""
+    data = {}
+    for field_info in fields(cls):
+        value = getattr(args, field_info.name)
+        
+        # Handle enum conversion for dataclass fields
+        field_type, _ = _get_field_type_info(field_info.type)
+        if hasattr(field_type, '__bases__') and Enum in field_type.__bases__:
+            if isinstance(value, str):
+                value = field_type(value)
+        
+        data[field_info.name] = value
+    
+    return cls(**data)
+
+
 def cmd_conf(func: Callable) -> Callable:
-
-    def _load_config_file(config_path: str, is_json: bool = False) -> Dict[str, Any]:
-        if not config_path:
-            return {}
-
-        try:
-            with open(config_path, "r") as f:
-                if is_json:
-                    return json.load(f) or {}
-                else:
-                    return yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.warning(f"Failed to load config because {e}. Proceeding without it.")
-            return {}
-
-    # pyre-ignore [3]
+    """
+    Simplified command-line configuration decorator.
+    
+    This decorator automatically creates command-line arguments for all dataclass
+    parameters of the decorated function and supports loading defaults from YAML/JSON files.
+    """
     def wrapper() -> Any:
         sig = inspect.signature(func)
-        parser = argparse.ArgumentParser(func.__doc__)
-
+        parser = argparse.ArgumentParser(description=func.__doc__)
+        
+        # Add config file arguments
+        parser.add_argument("--yaml_config", type=str, help="YAML config file path")
+        parser.add_argument("--json_config", type=str, help="JSON config file path")
         parser.add_argument(
-            "--yaml_config",
-            type=str,
-            default=None,
-            help="YAML config file for benchmarking",
+            "--loglevel", 
+            type=str, 
+            default="INFO",
+            help="Set the logging level (DEBUG, INFO, WARNING, ERROR)"
         )
-
-        parser.add_argument(
-            "--json_config",
-            type=str,
-            default=None,
-            help="JSON config file for benchmarking",
-        )
-
-        # Add loglevel argument with current logger level as default
-        parser.add_argument(
-            "--loglevel",
-            type=str,
-            default=logging._levelToName[logger.level],
-            help="Set the logging level (e.g. info, debug, warning, error)",
-        )
-
+        
+        # Parse config files first
         pre_args, _ = parser.parse_known_args()
-
-        yaml_defaults: Dict[str, Any] = (
-            _load_config_file(pre_args.yaml_config, is_json=False)
-            if pre_args.yaml_config
-            else {}
-        )
-        json_defaults: Dict[str, Any] = (
-            _load_config_file(pre_args.json_config, is_json=True)
-            if pre_args.json_config
-            else {}
-        )
-        # Merge the two dictionaries, JSON overrides YAML
-        merged_defaults = {**yaml_defaults, **json_defaults}
-
-        seen_args = set()  # track all --<name> we've added
-
-        for _name, param in sig.parameters.items():
+        
+        yaml_config = _load_config_file(pre_args.yaml_config, is_json=False)
+        json_config = _load_config_file(pre_args.json_config, is_json=True)
+        merged_config = {**yaml_config, **json_config}  # JSON overrides YAML
+        
+        # Add arguments for each dataclass parameter
+        seen_args = set()
+        for param_name, param in sig.parameters.items():
             cls = param.annotation
             if not is_dataclass(cls):
                 continue
-
-            for f in fields(cls):
-                arg_name = f.name
+            
+            for field_info in fields(cls):
+                arg_name = field_info.name
                 if arg_name in seen_args:
-                    logger.warning(f"WARNING: duplicate argument {arg_name}")
+                    logger.warning(f"Duplicate argument: {arg_name}")
                     continue
                 seen_args.add(arg_name)
-
-                ftype = f.type
-                origin = get_origin(ftype)
-
-                # Unwrapping Optional[X] to X
-                if origin is Union and type(None) in get_args(ftype):
-                    non_none = [t for t in get_args(ftype) if t is not type(None)]
-                    if len(non_none) == 1:
-                        ftype = non_none[0]
-                        origin = get_origin(ftype)
-
-                # Handle default_factory value and allow config to override
-                # Try snake_case version first, then original class name
-                snake_case_class_name = ''.join(['_' + c.lower() if c.isupper() else c for c in cls.__name__]).lstrip('_')
                 
-                default_value = merged_defaults.get(
-                    arg_name,  # flat lookup
-                    merged_defaults.get(snake_case_class_name, {}).get(  # snake_case hierarchy lookup
-                        arg_name,
-                        merged_defaults.get(cls.__name__, {}).get(  # original hierarchy lookup
-                            arg_name,
-                            (
-                                f.default_factory()  # pyre-ignore [29]
-                                if f.default_factory is not MISSING
-                                else f.default
-                            ),
-                        ),
-                    ),
+                field_type, origin = _get_field_type_info(field_info.type)
+                default_value = _get_default_value(field_info, merged_config, cls.__name__)
+                
+                arg_kwargs = _create_argument_parser_kwargs(
+                    field_type, origin, default_value, cls.__name__, field_info.name
                 )
-
-                arg_kwargs = {
-                    "default": default_value,
-                    "help": f"({cls.__name__}) {arg_name}",
-                }
-
-                if origin in (list, List):
-                    elem_type = get_args(ftype)[0]
-                    arg_kwargs.update(nargs="*", type=elem_type)
-                elif ftype is bool:
-                    # Special handling for boolean arguments
-                    arg_kwargs.update(type=lambda x: x.lower() in ["true", "1", "yes"])
-                elif hasattr(ftype, '__bases__') and Enum in ftype.__bases__:
-                    # Special handling for enum arguments
-                    def enum_converter(x):
-                        if isinstance(x, str):
-                            return ftype(x)
-                        return x
-                    arg_kwargs.update(type=enum_converter)
-                else:
-                    arg_kwargs.update(type=ftype)
-
+                
                 parser.add_argument(f"--{arg_name}", **arg_kwargs)
-
+        
+        # Parse all arguments
         args = parser.parse_args()
-        logger.setLevel(logging.INFO)
-
-        # Build the dataclasses
+        
+        # Set logging level
+        loglevel = getattr(logging, args.loglevel.upper(), logging.INFO)
+        logger.setLevel(loglevel)
+        
+        # Build dataclass instances
         kwargs = {}
-        for name, param in sig.parameters.items():
+        for param_name, param in sig.parameters.items():
             cls = param.annotation
             if is_dataclass(cls):
-                data = {}
-                for f in fields(cls):
-                    value = getattr(args, f.name)
-                    # Handle enum conversion for dataclass fields
-                    if hasattr(f.type, '__bases__') and Enum in f.type.__bases__:
-                        if isinstance(value, str):
-                            value = f.type(value)
-                    data[f.name] = value
-                config_instance = cls(**data)  # pyre-ignore [29]
-                kwargs[name] = config_instance
-                logger.info(config_instance)
-
-        loglevel = logging._nameToLevel[args.loglevel.upper()]
-        logger.setLevel(loglevel)
-
+                config_instance = _build_dataclass_from_args(cls, args)
+                kwargs[param_name] = config_instance
+                logger.info(f"{cls.__name__}: {config_instance}")
+        
         return func(**kwargs)
-
+    
     return wrapper
 
 

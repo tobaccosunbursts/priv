@@ -15,20 +15,18 @@ unified_benchmark_config:
     pin_memory: true
     hidden_layer_size: 20
     deep_fm_dimension: 5
-
-run_options:
-  world_size: 2
-  num_batches: 10
-  sharding_type: "table_wise"
-  compute_kernel: "fused"
-  input_type: "kjt"
-  planner_type: "embedding"
-  dense_optimizer: "SGD"
-  dense_lr: 0.1
-  sparse_optimizer: "EXACT_ADAGRAD"
-  sparse_lr: 0.1
-
-embedding_tables_config:
-  num_unweighted_features: 100
-  num_weighted_features: 100
-  embedding_feature_dim: 128
+  run_options:
+    world_size: 2
+    num_batches: 10
+    sharding_type: "table_wise"
+    compute_kernel: "fused"
+    input_type: "kjt"
+    planner_type: "embedding"
+    dense_optimizer: "SGD"
+    dense_lr: 0.1
+    sparse_optimizer: "EXACT_ADAGRAD"
+    sparse_lr: 0.1
+  embedding_tables_config:
+    num_unweighted_features: 100
+    num_weighted_features: 100
+    embedding_feature_dim: 128

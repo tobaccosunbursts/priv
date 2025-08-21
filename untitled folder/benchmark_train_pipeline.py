@@ -5,16 +5,23 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 # pyre-strict
 
 """
+Pipeline benchmarking utilities for TorchRec.
+
+This module provides core functionality for running pipeline-level benchmarks.
+For running benchmarks, use unified_benchmark_runner.py instead.
+
 Example usage:
 
 Buck2 (internal):
-    buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_train_pipeline -- --world_size=2 --pipeline=sparse --batch_size=10
+    buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:unified_benchmark_runner -- --yaml_config=pipeline_benchmark_config.yaml
 
 OSS (external):
-    python -m torchrec.distributed.benchmark.benchmark_train_pipeline --world_size=4 --pipeline=sparse --batch_size=10
+    python -m torchrec.distributed.benchmark.unified_benchmark_runner --yaml_config=pipeline_benchmark_config.yaml
 
 Adding New Model Support:
     See benchmark_pipeline_utils.py for step-by-step instructions.
@@ -38,7 +45,6 @@ from torchrec.distributed.benchmark.benchmark_utils import (
     benchmark_func,
     benchmark_module,
     BenchmarkResult,
-    cmd_conf,
     CPUMemoryStats,
     generate_planner,
     generate_sharded_model_and_optimizer,
@@ -72,8 +78,10 @@ class BenchmarkType(Enum):
 class UnifiedBenchmarkConfig:
     """Unified configuration for both pipeline and module benchmarking."""
     benchmark_type: BenchmarkType = BenchmarkType.PIPELINE
-    pipeline_config: Optional["PipelineConfig"] = None
-    model_config: Optional["ModelSelectionConfig"] = None
+    pipeline_config: Optional[PipelineConfig] = None
+    model_config: Optional[ModelSelectionConfig] = None
+    run_options: Optional[RunOptions] = None
+    embedding_tables_config: Optional[EmbeddingTablesConfig] = None
 
     def __post_init__(self) -> None:
         """Set default values for benchmark configuration."""
@@ -81,6 +89,10 @@ class UnifiedBenchmarkConfig:
             self.pipeline_config = PipelineConfig()
         if self.model_config is None:
             self.model_config = ModelSelectionConfig()
+        if self.run_options is None:
+            self.run_options = RunOptions()
+        if self.embedding_tables_config is None:
+            self.embedding_tables_config = EmbeddingTablesConfig()
 
 
 @dataclass
@@ -289,73 +301,6 @@ def run_module_benchmark(
     )
 
 
-@cmd_conf
-def main(
-    run_option: RunOptions,
-    table_config: EmbeddingTablesConfig,
-    model_selection: ModelSelectionConfig,
-    pipeline_config: PipelineConfig,
-    unified_config: UnifiedBenchmarkConfig,
-    model_config: Optional[BaseModelConfig] = None,
-) -> None:
-    """
-    Main function for benchmark_train_pipeline.py - kept for backward compatibility.
-    
-    This function provides the original interface for pipeline benchmarking.
-    For new unified benchmarking with YAML support, use unified_benchmark_runner.py instead.
-    """
-    if unified_config.benchmark_type == BenchmarkType.MODULE:
-        logger.info("Running module-level benchmark...")
-        result = run_module_benchmark(unified_config, table_config, run_option)
-        logger.info(f"Module benchmark completed: {result}")
-    elif unified_config.benchmark_type == BenchmarkType.PIPELINE:
-        logger.info("Running pipeline-level benchmark...")
-        tables, weighted_tables = generate_tables(
-            num_unweighted_features=table_config.num_unweighted_features,
-            num_weighted_features=table_config.num_weighted_features,
-            embedding_feature_dim=table_config.embedding_feature_dim,
-        )
-
-        if model_config is None:
-            model_config = create_model_config(
-                model_name=model_selection.model_name,
-                batch_size=model_selection.batch_size,
-                batch_sizes=model_selection.batch_sizes,
-                num_float_features=model_selection.num_float_features,
-                feature_pooling_avg=model_selection.feature_pooling_avg,
-                use_offsets=model_selection.use_offsets,
-                dev_str=model_selection.dev_str,
-                long_kjt_indices=model_selection.long_kjt_indices,
-                long_kjt_offsets=model_selection.long_kjt_offsets,
-                long_kjt_lengths=model_selection.long_kjt_lengths,
-                pin_memory=model_selection.pin_memory,
-                embedding_groups=model_selection.embedding_groups,
-                feature_processor_modules=model_selection.feature_processor_modules,
-                max_feature_lengths=model_selection.max_feature_lengths,
-                over_arch_clazz=model_selection.over_arch_clazz,
-                postproc_module=model_selection.postproc_module,
-                zch=model_selection.zch,
-                hidden_layer_size=model_selection.hidden_layer_size,
-                deep_fm_dimension=model_selection.deep_fm_dimension,
-                dense_arch_layer_sizes=model_selection.dense_arch_layer_sizes,
-                over_arch_layer_sizes=model_selection.over_arch_layer_sizes,
-            )
-
-        run_multi_process_func(
-            func=runner,
-            world_size=run_option.world_size,
-            tables=tables,
-            weighted_tables=weighted_tables,
-            run_option=run_option,
-            model_config=model_config,
-            pipeline_config=pipeline_config,
-        )
-    else:
-        raise ValueError(
-            f"Unknown benchmark_type: {unified_config.benchmark_type}. Must be BenchmarkType.MODULE or BenchmarkType.PIPELINE"
-        )
-
-
 def run_pipeline(
     run_option: RunOptions,
     table_config: EmbeddingTablesConfig,
@@ -532,7 +477,3 @@ def runner(
             logger.info(result)
 
         return result
-
-
-if __name__ == "__main__":
-    main()
