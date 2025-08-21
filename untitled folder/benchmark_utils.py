@@ -913,17 +913,9 @@ def _create_argument_parser_kwargs(field_type: Any, origin: Any, default_value: 
     elif field_type is bool:
         arg_kwargs.update(type=lambda x: x.lower() in ["true", "1", "yes"])
     elif isinstance(field_type, type) and issubclass(field_type, Enum):
-        # Create a safe enum converter that handles all cases
-        def safe_enum_converter(value):
-            # If it's already the right enum type, return as-is
-            if isinstance(value, field_type):
-                return value
-            # If it's a string, try to convert
-            if isinstance(value, str):
-                return field_type(value)
-            # For any other type, try to convert to string first, then enum
-            return field_type(str(value))
-        arg_kwargs.update(type=safe_enum_converter)
+        # Simple approach: just use the enum class directly as the type
+        # This should work because Enum classes are callable
+        arg_kwargs.update(type=field_type)
     else:
         arg_kwargs.update(type=field_type)
     
@@ -936,7 +928,16 @@ def _build_dataclass_from_args(cls: Any, args: argparse.Namespace) -> Any:
     for field_info in fields(cls):
         value = getattr(args, field_info.name)
         
-        # Note: Enum conversion should already be handled by argparse type converters
+        # Handle enum conversion for fields that were parsed as strings
+        original_field_type = field_info.type
+        if hasattr(original_field_type, '__origin__'):  # Handle Optional[Enum]
+            args_types = get_args(original_field_type)
+            if len(args_types) == 2 and type(None) in args_types:
+                original_field_type = next(arg for arg in args_types if arg is not type(None))
+        
+        if isinstance(original_field_type, type) and issubclass(original_field_type, Enum):
+            if isinstance(value, str):
+                value = original_field_type(value)
         
         data[field_info.name] = value
     
@@ -988,11 +989,25 @@ def cmd_conf(func: Callable) -> Callable:
                 field_type, origin = _get_field_type_info(field_info.type)
                 default_value = _get_default_value(field_info, merged_config, cls.__name__)
                 
-                # Let argparse handle enum conversion - don't convert defaults here
+                # Special handling for enums - check the original field type
+                original_field_type = field_info.type
+                if hasattr(original_field_type, '__origin__'):  # Handle Optional[Enum]
+                    args = get_args(original_field_type)
+                    if len(args) == 2 and type(None) in args:
+                        original_field_type = next(arg for arg in args if arg is not type(None))
                 
-                arg_kwargs = _create_argument_parser_kwargs(
-                    field_type, origin, default_value, cls.__name__, field_info.name
-                )
+                # If it's an enum, use a simple string type and handle conversion later
+                if isinstance(original_field_type, type) and issubclass(original_field_type, Enum):
+                    arg_kwargs = {
+                        "default": default_value.value if hasattr(default_value, 'value') else str(default_value),
+                        "help": f"({cls.__name__}) {field_info.name}",
+                        "type": str,
+                        "choices": [e.value for e in original_field_type],
+                    }
+                else:
+                    arg_kwargs = _create_argument_parser_kwargs(
+                        field_type, origin, default_value, cls.__name__, field_info.name
+                    )
                 
                 parser.add_argument(f"--{arg_name}", **arg_kwargs)
         
