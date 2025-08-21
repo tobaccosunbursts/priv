@@ -75,27 +75,6 @@ class BenchmarkType(Enum):
 
 
 @dataclass
-class UnifiedBenchmarkConfig:
-    """Unified configuration for both pipeline and module benchmarking."""
-    benchmark_type: BenchmarkType = BenchmarkType.PIPELINE
-    pipeline_config: Optional[PipelineConfig] = None
-    model_config: Optional[ModelSelectionConfig] = None
-    run_options: Optional[RunOptions] = None
-    embedding_tables_config: Optional[EmbeddingTablesConfig] = None
-
-    def __post_init__(self) -> None:
-        """Set default values for benchmark configuration."""
-        if self.pipeline_config is None:
-            self.pipeline_config = PipelineConfig()
-        if self.model_config is None:
-            self.model_config = ModelSelectionConfig()
-        if self.run_options is None:
-            self.run_options = RunOptions()
-        if self.embedding_tables_config is None:
-            self.embedding_tables_config = EmbeddingTablesConfig()
-
-
-@dataclass
 class RunOptions:
     """
     Configuration options for running sparse neural network benchmarks.
@@ -234,7 +213,25 @@ class ModelSelectionConfig:
     over_arch_layer_sizes: List[int] = field(default_factory=lambda: [5, 1])
 
 
+@dataclass
+class UnifiedBenchmarkConfig:
+    """Unified configuration for both pipeline and module benchmarking."""
+    benchmark_type: BenchmarkType = BenchmarkType.PIPELINE
+    pipeline_config: Optional[PipelineConfig] = None
+    model_config: Optional[ModelSelectionConfig] = None
+    run_options: Optional[RunOptions] = None
+    embedding_tables_config: Optional[EmbeddingTablesConfig] = None
 
+    def __post_init__(self) -> None:
+        """Set default values for benchmark configuration."""
+        if self.pipeline_config is None:
+            self.pipeline_config = PipelineConfig()
+        if self.model_config is None:
+            self.model_config = ModelSelectionConfig()
+        if self.run_options is None:
+            self.run_options = RunOptions()
+        if self.embedding_tables_config is None:
+            self.embedding_tables_config = EmbeddingTablesConfig()
 
 
 def run_module_benchmark(
